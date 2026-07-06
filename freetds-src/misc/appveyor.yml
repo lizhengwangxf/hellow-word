@@ -1,0 +1,176 @@
+skip_tags: false
+
+branches:
+  except:
+    - camber
+    - origin
+    - BRANCH0_60
+    - BRANCH0_61
+    - BRANCH0_62
+    - BRANCH0_63
+    - BRANCH0_64
+    - BRANCH0_82
+    - Branch-0_91
+
+services:
+- mssql2016
+
+version: "{build}"
+
+shallow_clone: true
+
+environment:
+
+  global:
+    # SDK v7.0 MSVC Express 2008's SetEnv.cmd script will fail if the
+    # /E:ON and /V:ON options are not enabled in the batch script intepreter
+    # See: http://stackoverflow.com/a/13751649/163740
+    WITH_COMPILER: "cmd /E:ON /V:ON /C ..\\misc\\run_with_compiler.cmd"
+    WIN_ICONV_VER: fixed
+
+  matrix:
+  - PLAT: Win64
+    WIDTH: 64
+    VS_VERSION: "2017"
+    TDSVER: "7.3"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+
+  - PLAT: Win32
+    WIDTH: 32
+    VS_VERSION: "2017"
+    TDSVER: "7.2"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+    ODBC_MARS: "1"
+
+  - PLAT: Win64
+    WIDTH: 64
+    VS_VERSION: "2015"
+    TDSVER: "7.3"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+
+  - PLAT: Win32
+    WIDTH: 32
+    VS_VERSION: "2015"
+    TDSVER: "7.2"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2017
+
+  - PLAT: Win64
+    WIDTH: 64
+    VS_VERSION: "2013"
+    TDSVER: "auto"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2015
+    ODBC_MARS: "1"
+
+  - PLAT: Win32
+    WIDTH: 32
+    VS_VERSION: "2010"
+    TDSVER: "7.1"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2015
+
+  - PLAT: Win32
+    WIDTH: 32
+    VS_VERSION: "2008"
+    TDSVER: "7.0"
+    APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2015
+
+configuration:
+  - release
+
+install:
+  # win-iconv
+  - appveyor DownloadFile https://github.com/FreeTDS/win-iconv/archive/%WIN_ICONV_VER%.zip
+  - 7z x %WIN_ICONV_VER%.zip
+  - ren win-iconv-%WIN_ICONV_VER% iconv
+  - mkdir iconv-build
+  - cd iconv-build
+  - "%WITH_COMPILER% cmake -G \"NMake Makefiles\" -DBUILD_STATIC=on -D BUILD_SHARED=off -DBUILD_EXECUTABLE=off -DBUILD_TEST=on -DCMAKE_BUILD_TYPE=Release ..\\iconv"
+  - "%WITH_COMPILER% nmake"
+  - win_iconv_test.exe
+  - cd ..\iconv
+  - mkdir include
+  - mkdir lib
+  - copy iconv.h include
+  - copy ..\iconv-build\iconv.lib lib
+  - cd ..
+  # if cache doesn't have it, download it
+  - >
+    if not exist C:\Windows\gperf.exe (
+    (curl -L -o %TEMP%\gperf.zip http://kent.dl.sourceforge.net/project/gnuwin32/gperf/3.0.1/gperf-3.0.1-bin.zip && 7z e %TEMP%\gperf.zip -oC:\Windows bin\gperf.exe)
+    || (curl -L -o %TEMP%\gperf.zip https://sourceforge.net/projects/gnuwin32/files/gperf/3.0.1/gperf-3.0.1-bin.zip/download# && 7z e %TEMP%\gperf.zip -oC:\Windows bin\gperf.exe)
+    || (curl -L -o %TEMP%\gperf.zip https://www.freetds.org/gperf-3.0.1-bin.zip && 7z e %TEMP%\gperf.zip -oC:\Windows bin\gperf.exe))
+
+build_script:
+  # build FreeTDS
+  - mkdir build
+  - cd build
+  - set OPENSSL_ROOT_DIR=c:\openssl-v111-win%WIDTH%
+  - set DEST_DIR=vs%VS_VERSION%_%WIDTH%-%APPVEYOR_REPO_BRANCH%
+  - "%WITH_COMPILER% cmake -G \"NMake Makefiles\" -DCMAKE_BUILD_TYPE=Release \"-DCMAKE_INSTALL_PREFIX:PATH=%DEST_DIR%\" \"-DOPENSSL_ROOT_DIR=%OPENSSL_ROOT_DIR%\" .."
+  - "%WITH_COMPILER% nmake"
+  - set PATH=c:\openssl-v111-win%WIDTH%\bin;%PATH%
+  - src\apps\tsql.exe -C
+  - cd ..
+  - mkdir build_debug
+  - cd build_debug
+  - "%WITH_COMPILER% cmake -G \"NMake Makefiles\" -DCMAKE_BUILD_TYPE=Debug -DENABLE_EXTRA_CHECKS=on \"-DCMAKE_INSTALL_PREFIX:PATH=%DEST_DIR%\" \"-DOPENSSL_ROOT_DIR=%OPENSSL_ROOT_DIR%\" .."
+  - "%WITH_COMPILER% nmake"
+  - src\apps\tsql.exe -C
+  - cd ..
+  - mkdir build_withoutssl
+  - cd build_withoutssl
+  - set OPENSSL_ROOT_DIR=
+  - "%WITH_COMPILER% cmake -G \"NMake Makefiles\" -DCMAKE_BUILD_TYPE=Release -DWITH_OPENSSL=off \"-DCMAKE_INSTALL_PREFIX:PATH=%DEST_DIR%\" .."
+  - "%WITH_COMPILER% nmake"
+  - src\apps\tsql.exe -C
+  - cd ..
+
+test_script:
+  - set INSTANCENAME=SQL2016
+  - "powershell misc\\sql-server-activate-tcp-fixed-port.ps1"
+  # Create freetds.conf
+  # Create a test database
+  - sqlcmd -S localhost -U sa -P Password12! -Q "CREATE DATABASE freetds_test"
+  - cd build_debug
+  - echo [global]> freetds.conf.local
+  - echo port = 1433>> freetds.conf.local
+  - echo tds version = %TDSVER%>> freetds.conf.local
+  - echo [local]>> freetds.conf.local
+  - echo host = 127.0.0.1>> freetds.conf.local
+  # Create PWD
+  - echo UID=sa> PWD
+  - echo PWD=Password12!>> PWD
+  - echo SRV=local>> PWD
+  - echo DB=tempdb>> PWD
+  - set FREETDSCONF=%CD%\freetds.conf.local
+  - set TDSDUMP=%CD%\conndump
+  - set TDSDUMPCONFIG=%CD%\confdump
+  - set TDS_SKIP_SUCCESS=1
+  # Add dirs of our just built DLLs to PATH envvar so everything works
+  - set PATH=%CD%\src\ctlib;%CD%\src\dblib;%PATH%
+  # register ODBC driver
+  - "%WINDIR%\\SysWOW64\\regsvr32 /s src\\odbc\\tdsodbc.dll || %WINDIR%\\system32\\regsvr32 /s src\\odbc\\tdsodbc.dll"
+  # Build and run tests
+  - set CTEST_OUTPUT_ON_FAILURE=1
+  - "%WITH_COMPILER% nmake check"
+  - cd ..
+
+after_test:
+  - type %CD%\build_debug\confdump
+  - type %CD%\build_debug\conndump
+  # Create zipball artifact
+  - cd build
+  - "%WITH_COMPILER% nmake install"
+  - set DEST_DIR=vs%VS_VERSION%_%WIDTH%-%APPVEYOR_REPO_BRANCH%
+  - 7z a ..\%DEST_DIR%.zip %DEST_DIR%
+  # END of non-test code specifically related to creation of artifacts published via GitHub  - 7z a ..\%DEST_DIR%.zip %DEST_DIR%
+  - cd ..
+  # Create zipball artifact for nossl
+  - cd build_withoutssl
+  - "%WITH_COMPILER% nmake install"
+  - set DEST_DIR=vs%VS_VERSION%_%WIDTH%-%APPVEYOR_REPO_BRANCH%
+  - 7z a ..\%DEST_DIR%_withoutssl.zip %DEST_DIR%
+  # END of non-test code specifically related to creation of artifacts published via GitHub  - 7z a ..\%DEST_DIR%.zip %DEST_DIR%
+  - cd ..
+
+artifacts:
+  - path: vs*.zip
