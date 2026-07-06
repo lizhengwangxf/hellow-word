@@ -9,8 +9,13 @@
  *   1. 监听一个 TCP 端口 (默认 4500)
  *   2. 接收 TDS 5.0 login 包 (0x02), 回 CAPABILITY + LOGINACK + DONE
  *   3. 接收 language 批处理包 (0x0F), 内含 TDS_LANGUAGE_TOKEN(0x21)
- *      - 若 SQL 含 "select ... from TB_AppConfig" -> 返回 mock 结果集
+ *      - 若 SQL 含 "from TB_AppConfig" -> 加载 TB_AppConfig.csv 返回结果集
+ *        支持简单 WHERE col='val' 单条件过滤
  *      - 其它 SQL -> 回一个空 DONE (成功, 无结果)
+ *   4. TDS5 动态 SQL (0xE7, prepare/exec/dealloc): isql 的 SQLPrepare/SQLExecute
+ *
+ * 数据文件: 默认从工作目录读取 <TableName>.csv (第一行表头, 逗号分隔)
+ *   可用环境变量 MOCK_DATA_DIR 指定数据目录
  *
  * 编译: gcc -O2 -Wall -o mockserver mockserver.c
  * 运行: ./mockserver [port]
@@ -19,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
@@ -242,21 +248,27 @@ static const col_def_t g_cols[] = {
 };
 #define NCOLS (int)(sizeof(g_cols)/sizeof(g_cols[0]))
 
-/* mock 数据行 (全部用字符串表达, INT 列会转成 4 字节 LE) */
-static const char *g_rows[][NCOLS] = {
-    { "1001", "OrderService",   "DB_TIMEOUT",  "30",     "order db timeout seconds",     "1" },
-    { "1002", "OrderService",   "MAX_RETRY",   "3",      "max retry count",              "1" },
-    { "1003", "PaymentService", "CURRENCY",    "CNY",    "default currency",             "1" },
-    { "1004", "PaymentService", "RATE_LIMIT",  "1000",   "qps limit",                    "0" },
-    { "1005", "UserService",    "SESSION_TTL", "3600",   "session ttl seconds",          "1" },
-    { "1006", "UserService",    "PWD_POLICY",  "STRONG", "password policy",              "1" },
-    { "1007", "Gateway",        "PORT",        "8080",   "listen port",                  "1" },
-    { "1008", "Gateway",        "TLS_ENABLED", "1",      "enable tls",                   "1" },
-};
-#define NROWS (int)(sizeof(g_rows)/sizeof(g_rows[0]))
+/* mock 数据行: 从 CSV 文件加载, 每行 NCOLS 个字符串字段 */
+typedef struct {
+    char **cells;     /* NCOLS 个 char* */
+} row_t;
 
-/* 构造结果集: RESULT(列元数据) + N x ROW + DONE(COUNT) */
-static void build_result_set(buf_t *b) {
+/* 简单 WHERE 条件: col='val' (单条件). col_idx=-1 表示无 WHERE / 列未识别 */
+typedef struct {
+    int col_idx;
+    char value[256];
+} where_t;
+
+/* 构造结果集: RESULT(列元数据) + N x ROW + DONE(COUNT)
+ * rows 中只输出满足 where 条件的行. */
+static void build_result_set(buf_t *b, row_t *rows, int nrows, const where_t *w) {
+    /* 先统计匹配行数, 用于 DONE COUNT */
+    int matched = 0;
+    for (int r = 0; r < nrows; r++) {
+        if (w->col_idx < 0 || strcmp(rows[r].cells[w->col_idx], w->value) == 0)
+            matched++;
+    }
+
     size_t start = b->len;
     buf_byte(b, TDS_RESULT_TOK);
     size_t totlen_off = b->len;
@@ -284,31 +296,34 @@ static void build_result_set(buf_t *b) {
     uint16_t totlen = (uint16_t)(b->len - (start + 1));
     buf_patch_le16(b, totlen_off, totlen);
 
-    /* 行 */
-    for (int r = 0; r < NROWS; r++) {
+    /* 行 (只输出匹配 where 的行) */
+    for (int r = 0; r < nrows; r++) {
+        if (w->col_idx >= 0 && strcmp(rows[r].cells[w->col_idx], w->value) != 0)
+            continue;
         buf_byte(b, TDS_ROW_TOK);
         for (int c = 0; c < NCOLS; c++) {
+            const char *val = rows[r].cells[c];
             if (g_cols[c].variable) {
                 /* SYBCHAR: 1 字节长度 + 数据 */
-                size_t l = strlen(g_rows[r][c]);
+                size_t l = strlen(val);
                 if (l > 255) l = 255;
                 buf_byte(b, (unsigned char)l);
-                buf_put(b, g_rows[r][c], l);
+                buf_put(b, val, l);
             } else if (g_cols[c].type == SYBINT4) {
                 /* 4 字节 LE int */
-                long v = strtol(g_rows[r][c], NULL, 10);
+                long v = strtol(val, NULL, 10);
                 buf_le32(b, (uint32_t)v);
             } else if (g_cols[c].type == SYBINT1) {
-                long v = strtol(g_rows[r][c], NULL, 10);
+                long v = strtol(val, NULL, 10);
                 buf_byte(b, (unsigned char)(v & 0xff));
             } else if (g_cols[c].type == SYBBIT) {
-                buf_byte(b, g_rows[r][c][0] == '0' ? 0 : 1);
+                buf_byte(b, val[0] == '0' ? 0 : 1);
             }
         }
     }
 
-    /* DONE + COUNT */
-    build_done(b, TDS_DONE_FINAL | TDS_DONE_COUNT, (uint32_t)NROWS);
+    /* DONE + COUNT (用匹配行数, 而非总行数) */
+    build_done(b, TDS_DONE_FINAL | TDS_DONE_COUNT, (uint32_t)matched);
 }
 
 /* 构造一个简单的 ERROR token (用于不支持的语句时可选) */
@@ -366,12 +381,183 @@ static char *extract_sql(const buf_t *pkt) {
     return sql;
 }
 
+/* ---------------- CSV 数据加载 ---------------- */
+/* 数据目录: 默认工作目录, 可用环境变量 MOCK_DATA_DIR 覆盖 */
+static const char *data_dir(void) {
+    const char *d = getenv("MOCK_DATA_DIR");
+    return (d && *d) ? d : ".";
+}
+
+/* 加载 CSV 文件 (第一行表头跳过, 逗号分隔, 不处理引号).
+ * 返回 malloc 的 row_t 数组, *out_nrows = 行数; 失败返回 NULL. */
+static row_t *load_csv(const char *table_name, int *out_nrows) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.csv", data_dir(), table_name);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[mock] load_csv: cannot open %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    row_t *rows = NULL;
+    int cap = 0, n = 0;
+    char line[4096];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        if (line_no == 1) continue;            /* 跳过表头 */
+        size_t l = strlen(line);
+        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+        if (l == 0) continue;
+
+        /* 按逗号分割, 最多 NCOLS-1 个逗号 -> NCOLS 个字段 (最后一个含剩余字符) */
+        char *fields[NCOLS];
+        int nf = 0;
+        char *start = line;
+        char *p = line;
+        while (*p && nf < NCOLS - 1) {
+            if (*p == ',') {
+                *p = 0;
+                fields[nf++] = start;
+                start = p + 1;
+            }
+            p++;
+        }
+        fields[nf++] = start;                  /* 最后一个字段 */
+        while (nf < NCOLS) fields[nf++] = "";  /* 字段不足补空串 */
+
+        if (n >= cap) {
+            cap = cap ? cap * 2 : 16;
+            rows = realloc(rows, cap * sizeof(row_t));
+            if (!rows) { fclose(f); return NULL; }
+        }
+        rows[n].cells = malloc(NCOLS * sizeof(char*));
+        for (int i = 0; i < NCOLS; i++)
+            rows[n].cells[i] = strdup(fields[i]);
+        n++;
+    }
+    fclose(f);
+    *out_nrows = n;
+    fprintf(stderr, "[mock] loaded %d rows from %s\n", n, path);
+    return rows;
+}
+
+static void free_rows(row_t *rows, int nrows) {
+    if (!rows) return;
+    for (int i = 0; i < nrows; i++) {
+        if (rows[i].cells) {
+            for (int j = 0; j < NCOLS; j++) free(rows[i].cells[j]);
+            free(rows[i].cells);
+        }
+    }
+    free(rows);
+}
+
+/* 从 SQL 中提取 'from <table>' 后的表名. 返回 malloc 字符串 (原样大小写).
+ * 找不到返回 NULL. */
+static char *extract_table_name(const char *sql) {
+    char buf[4096];
+    size_t n = strlen(sql);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, sql, n);
+    buf[n] = 0;
+    str_lower(buf);
+    char *p = strstr(buf, "from ");
+    if (!p) return NULL;
+    p += 5;                                     /* skip "from " */
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = p;
+    while (*end && *end != ' ' && *end != '\t' && *end != ';' && *end != '\n' && *end != '\r')
+        end++;
+    size_t tlen = end - p;
+    if (tlen == 0) return NULL;
+    char *name = malloc(tlen + 1);
+    memcpy(name, p, tlen);
+    name[tlen] = 0;
+    return name;                                /* 小写形式 */
+}
+
+/* 解析简单 WHERE col='val' (单条件, 不区分大小写列名).
+ * col_idx = 列在 g_cols 中的下标; -1 = 无 WHERE 或列未识别.
+ * value 保留原始大小写 (从小写副本定位, 但从原 SQL 提取值). */
+static where_t parse_where(const char *sql) {
+    where_t w;
+    w.col_idx = -1;
+    w.value[0] = 0;
+
+    char buf[4096];
+    size_t n = strlen(sql);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, sql, n);
+    buf[n] = 0;
+    str_lower(buf);
+
+    char *p = strstr(buf, "where ");
+    if (!p) return w;
+    size_t pos = (size_t)(p - buf) + 6;         /* skip "where " */
+    while (pos < n && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+
+    /* 列名: 到 空格/= 制表符 */
+    size_t cstart = pos;
+    while (pos < n && buf[pos] != ' ' && buf[pos] != '\t' && buf[pos] != '=') pos++;
+    size_t clen = pos - cstart;
+    if (clen == 0 || clen >= 64) return w;
+    char colname[64];
+    memcpy(colname, buf + cstart, clen);
+    colname[clen] = 0;
+
+    /* 跳过空格找 '=' */
+    while (pos < n && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+    if (pos >= n || buf[pos] != '=') return w;
+    pos++;
+    while (pos < n && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+
+    /* 期望 ' 或 " 开头; 也可以是裸值 */
+    char quote = 0;
+    if (pos < n && (buf[pos] == '\'' || buf[pos] == '"')) { quote = buf[pos]; pos++; }
+    size_t vstart = pos;
+    if (quote) {
+        while (pos < n && buf[pos] != quote) pos++;
+    } else {
+        while (pos < n && buf[pos] != ' ' && buf[pos] != ';') pos++;
+    }
+    size_t vlen = pos - vstart;
+    if (vlen == 0) return w;
+    if (vlen >= sizeof(w.value)) vlen = sizeof(w.value) - 1;
+    /* 从原始 sql 提取 value, 保留原大小写 */
+    memcpy(w.value, sql + vstart, vlen);
+    w.value[vlen] = 0;
+
+    /* 找列索引 (列名匹配不区分大小写) */
+    for (int i = 0; i < NCOLS; i++) {
+        if (strcasecmp(g_cols[i].name, colname) == 0) {
+            w.col_idx = i;
+            break;
+        }
+    }
+    return w;
+}
+
+/* 判断 SQL 是否针对 TB_AppConfig 表 (不区分大小写) */
+static int is_appconfig_sql(const char *sql) {
+    char *t = extract_table_name(sql);
+    int yes = (t && strcasecmp(t, "TB_AppConfig") == 0);
+    free(t);
+    return yes;
+}
+
 /* ---------------- TDS5 动态 SQL (prepared statement) ---------------- */
 /* FreeTDS ODBC 的 isql 走 SQLPrepare/SQLExecute, 在 TDS5 下体现为
  * dynamic token (0xE7): prepare(1) / execute(2) / dealloc(4).
  * 这里维护一个 id -> 已 prepare 的语句 的小表, 仅用于 mock. */
 #define MAX_DYN 32
-typedef struct { int used; char id[32]; char *stmt; int is_appconfig; } dyn_entry_t;
+typedef struct {
+    int used;
+    char id[32];
+    char *stmt;
+    int is_appconfig;     /* SQL 是否针对 TB_AppConfig */
+    where_t where;        /* prepare 时解析的 WHERE 条件, exec 时复用 */
+} dyn_entry_t;
 
 static dyn_entry_t *dyn_find(dyn_entry_t *d, const char *id) {
     for (int i = 0; i < MAX_DYN; i++)
@@ -418,7 +604,12 @@ static int handle_dynamic(const buf_t *pkt, buf_t *out, dyn_entry_t *dyns) {
         memcpy(stmt, p, slen); stmt[slen] = 0;
 
         dyn_entry_t *e = dyn_put(dyns, id);
-        if (e) { free(e->stmt); e->stmt = stmt; e->is_appconfig = sql_mentions(stmt, "tb_appconfig"); }
+        if (e) {
+            free(e->stmt);
+            e->stmt = stmt;
+            e->is_appconfig = is_appconfig_sql(stmt);
+            e->where = parse_where(stmt);
+        }
 
         /* 去掉换行方便日志 */
         char logbuf[256]; size_t ln = slen < sizeof(logbuf)-1 ? slen : sizeof(logbuf)-1;
@@ -438,8 +629,19 @@ static int handle_dynamic(const buf_t *pkt, buf_t *out, dyn_entry_t *dyns) {
         out->len = 0;
         dyn_entry_t *e = dyn_find(dyns, id);
         if (e && e->is_appconfig) {
-            build_result_set(out);
-            fprintf(stderr, "[mock] -> returning TB_AppConfig (%d rows)\n", NROWS);
+            int nrows = 0;
+            row_t *rows = load_csv("TB_AppConfig", &nrows);
+            if (rows) {
+                build_result_set(out, rows, nrows, &e->where);
+                if (e->where.col_idx >= 0)
+                    fprintf(stderr, "[mock] -> TB_AppConfig WHERE %s='%s'\n",
+                            g_cols[e->where.col_idx].name, e->where.value);
+                else
+                    fprintf(stderr, "[mock] -> returning TB_AppConfig (%d rows)\n", nrows);
+                free_rows(rows, nrows);
+            } else {
+                build_done(out, TDS_DONE_FINAL | TDS_DONE_ERROR, 0);
+            }
         } else {
             build_done(out, TDS_DONE_FINAL, 0);
         }
@@ -513,9 +715,21 @@ static void handle_client(int cfd, struct sockaddr_in *cli) {
                 fprintf(stderr, "[mock] SQL: %s\n", sql);
 
                 out.len = 0;
-                if (sql_mentions(sql, "tb_appconfig")) {
-                    build_result_set(&out);
-                    fprintf(stderr, "[mock] -> returning TB_AppConfig (%d rows)\n", NROWS);
+                if (is_appconfig_sql(sql)) {
+                    where_t w = parse_where(sql);
+                    int nrows = 0;
+                    row_t *rows = load_csv("TB_AppConfig", &nrows);
+                    if (rows) {
+                        build_result_set(&out, rows, nrows, &w);
+                        if (w.col_idx >= 0)
+                            fprintf(stderr, "[mock] -> TB_AppConfig WHERE %s='%s'\n",
+                                    g_cols[w.col_idx].name, w.value);
+                        else
+                            fprintf(stderr, "[mock] -> returning TB_AppConfig (%d rows)\n", nrows);
+                        free_rows(rows, nrows);
+                    } else {
+                        build_done(&out, TDS_DONE_FINAL | TDS_DONE_ERROR, 0);
+                    }
                 } else {
                     build_done(&out, TDS_DONE_FINAL, 0);
                 }
@@ -593,6 +807,7 @@ int main(int argc, char **argv) {
     if (listen(sfd, 16) < 0) { perror("listen"); return 1; }
 
     fprintf(stderr, "[mock] Sybase Open Server mock listening on 0.0.0.0:%d (TDS 5.0)\n", port);
+    fprintf(stderr, "[mock] data dir: %s  (override with MOCK_DATA_DIR env)\n", data_dir());
     fprintf(stderr, "[mock] try:  tsql -S mocksyb -U sa -P ''   (then: select * from TB_AppConfig\\ngo)\n");
 
     for (;;) {

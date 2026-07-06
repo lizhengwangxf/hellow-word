@@ -1,0 +1,9 @@
+AppConfigID,AppName,ConfigKey,ConfigValue,Remark,Status
+1001,OrderService,DB_TIMEOUT,30,order db timeout seconds,1
+1002,OrderService,MAX_RETRY,3,max retry count,1
+1003,PaymentService,CURRENCY,CNY,default currency,1
+1004,PaymentService,RATE_LIMIT,1000,qps limit,0
+1005,UserService,SESSION_TTL,3600,session ttl seconds,1
+1006,UserService,PWD_POLICY,STRONG,password policy,1
+1007,Gateway,PORT,8080,listen port,1
+1008,Gateway,TLS_ENABLED,1,enable tls,1
